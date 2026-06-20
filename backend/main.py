@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import httpx
+import time
 from collections import defaultdict
 from typing import AsyncGenerator
 
@@ -29,22 +30,21 @@ app = FastAPI(title="AI Interview Coach API", version="1.0.0")
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", os.getenv("FRONTEND_URL", "*")],
+    allow_origins=["http://localhost:3000", "http://localhost:3001", os.getenv("FRONTEND_URL", "*")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Use environment variable or fallback to hardcoded URL
 N8N_BASE = os.getenv("N8N_BASE_URL", "https://mykhann.app.n8n.cloud/webhook")
 print(f"🔗 N8N_BASE: {N8N_BASE}")
 
 # ── SSE Event Store ───────────────────────────────────────────────────────────
-# sessionId → asyncio.Queue of event dicts
 _queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-# sessionId → list of past events (for reconnect replay)
-_history: dict[str, list] = defaultdict(list)
+_sent_events: dict[str, set] = defaultdict(set)  # Track sent events to prevent duplicates
+_session_state: dict[str, dict] = defaultdict(dict)  # Track current state per session
+_latest_events: dict[str, dict] = defaultdict(dict)  # Store latest event per type
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -78,24 +78,68 @@ def _format_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _generate_event_id(session_id: str, event_name: str, data: dict) -> str:
+    """Generate a unique ID for each event to prevent duplicates."""
+    question_num = data.get('questionNumber', data.get('questionId', ''))
+    timestamp = data.get('timestamp', time.time())
+    return f"{session_id}_{event_name}_{question_num}_{timestamp}"
+
+
 async def _sse_generator(session_id: str) -> AsyncGenerator[str, None]:
     """Stream SSE events to the browser for a given session."""
     q = _queues[session_id]
+    
+    # 🔥 Don't replay old events - send only current state
+    state = _session_state.get(session_id, {})
+    if state:
+        yield _format_sse("sync", {
+            "step": state.get("step", "upload"),
+            "questionNumber": state.get("questionNumber", 0),
+            "totalQuestions": state.get("totalQuestions", 0)
+        })
 
-    # Replay missed events on reconnect
-    for past in _history.get(session_id, []):
-        yield _format_sse(past["event"], past["data"])
-
-    # Heartbeat + live events
+    # Live events
     while True:
         try:
             item = await asyncio.wait_for(q.get(), timeout=25)
-            if item is None:          # sentinel: session done
+            if item is None:  # sentinel: session done
                 yield _format_sse("done", {"message": "Session complete"})
                 break
-            yield _format_sse(item["event"], item["data"])
+            
+            event_name = item["event"]
+            data = item["data"]
+            
+            # Generate unique ID
+            event_id = _generate_event_id(session_id, event_name, data)
+            
+            # 🔥 Skip if already sent
+            if event_id in _sent_events[session_id]:
+                print(f"⏭️ Skipping duplicate event: {event_name}")
+                continue
+            
+            # Mark as sent
+            _sent_events[session_id].add(event_id)
+            
+            # Keep sent events set manageable
+            if len(_sent_events[session_id]) > 100:
+                _sent_events[session_id] = set(list(_sent_events[session_id])[-50:])
+            
+            # 🔥 Update session state
+            if event_name == "cv_result":
+                _session_state[session_id]["step"] = "set_job"
+            elif event_name == "job_match":
+                _session_state[session_id]["step"] = "ready"
+            elif event_name == "question":
+                _session_state[session_id]["step"] = "interview"
+                _session_state[session_id]["questionNumber"] = data.get("questionNumber", 0)
+                _session_state[session_id]["totalQuestions"] = data.get("totalQuestions", 0)
+            elif event_name == "report_ready":
+                _session_state[session_id]["step"] = "done"
+            
+            yield _format_sse(event_name, data)
+            
         except asyncio.TimeoutError:
-            yield ": heartbeat\n\n"   # keep connection alive
+            yield ": heartbeat\n\n"  # keep connection alive
 
 
 # ── SSE receive from n8n ──────────────────────────────────────────────────────
@@ -108,7 +152,6 @@ async def push_event(session_id: str, request: Request):
     try:
         body = await request.json()
     except json.JSONDecodeError:
-        # Handle case where body might not be JSON
         body = await request.body()
         try:
             body = json.loads(body)
@@ -118,11 +161,33 @@ async def push_event(session_id: str, request: Request):
     event_name = body.get("event", "message")
     data = body.get("data", body)
 
+    # Ensure sessionId is in the data
+    if 'sessionId' not in data:
+        data['sessionId'] = session_id
+    
+    # Add timestamp to make each event unique
+    data['timestamp'] = str(time.time())
+
     item = {"event": event_name, "data": data}
-    _history[session_id].append(item)
+    
+    # Store latest event per type
+    _latest_events[session_id][event_name] = data
+    
+    # 🔥 Clear old queue entries to prevent backlog
+    if _queues[session_id].qsize() > 5:
+        while not _queues[session_id].empty():
+            try:
+                _queues[session_id].get_nowait()
+            except:
+                break
+    
+    # Add small delay for question events
+    if event_name == "question":
+        await asyncio.sleep(0.3)
+    
     await _queues[session_id].put(item)
 
-    # Close stream if report is ready
+    # Send sentinel to close stream when done
     if event_name == "report_ready":
         await asyncio.sleep(0.5)
         await _queues[session_id].put(None)
@@ -150,7 +215,6 @@ async def _post_n8n(path: str, payload: dict) -> dict:
     """Send a POST request to n8n webhook with better error handling."""
     url = f"{N8N_BASE}/{path}"
     
-    # Debug logging
     print(f"🔗 Calling n8n webhook: {url}")
     print(f"📦 Payload keys: {list(payload.keys())}")
     
@@ -158,22 +222,17 @@ async def _post_n8n(path: str, payload: dict) -> dict:
         try:
             r = await client.post(url, json=payload)
             
-            # Debug response
             print(f"📊 Response status: {r.status_code}")
             print(f"📄 Response preview: {r.text[:200] if r.text else '(empty)'}")
             
-            # Check if response is empty
             if not r.text or r.text.strip() == "":
                 print("⚠️ Empty response from n8n")
                 return {"ok": True, "message": "Webhook processed successfully", "sessionId": payload.get("sessionId")}
             
-            # Try to parse as JSON
             try:
                 return r.json()
             except json.JSONDecodeError as e:
                 print(f"⚠️ Response is not valid JSON: {e}")
-                print(f"Raw response: {r.text[:500]}")
-                # Return a default response
                 return {
                     "ok": True, 
                     "message": "Webhook processed (non-JSON response)",
@@ -183,7 +242,6 @@ async def _post_n8n(path: str, payload: dict) -> dict:
                 
         except httpx.HTTPStatusError as e:
             print(f"❌ HTTP Error: {e.response.status_code}")
-            print(f"Response: {e.response.text[:500] if e.response.text else '(empty)'}")
             raise HTTPException(
                 status_code=e.response.status_code,
                 detail=f"n8n webhook error: {e.response.text[:200] if e.response.text else 'No response body'}"
@@ -295,7 +353,6 @@ async def health():
     }
 
 
-# ── Root endpoint ─────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
